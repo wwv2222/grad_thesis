@@ -16,4 +16,7 @@ import pandas as pd
 ee.Authenticate()
 ee.Initialize(project='grad-thesis-475918')
 
+# %%
+print("CLAUDE")
+
 
