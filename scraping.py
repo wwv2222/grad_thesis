@@ -1,22 +1,388 @@
-#%%
-cd 
-
 
 
 # %%
 import subprocess
 subprocess.run(["pip3", "install", "earthengine-api", "--quiet"])
-subprocess.run(["pip3", "install", "dropbox"])
+subprocess.run(["pip3", "install", "dropbox", "--quiet"])
+subprocess.run(["pip3", "install", "python-dotenv", "google-api-python-client", "--quiet"])
 
 # %%
 import ee
-import pandas as pd
 
 # %%
 ee.Authenticate()
 ee.Initialize(project='grad-thesis-475918')
 
 # %%
-print("CLAUDE")
+#Getting Citites 
+cities_southeast_20 = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([-95.3698, 29.7604]), {'city': 'Houston', 'state': 'TX', 'rank': 1, 'radius_km': 30}),
+  ee.Feature(ee.Geometry.Point([-98.4936, 29.4241]), {'city': 'San Antonio', 'state': 'TX', 'rank': 2, 'radius_km': 25}),
+  ee.Feature(ee.Geometry.Point([-96.7970, 32.7767]), {'city': 'Dallas', 'state': 'TX', 'rank': 3, 'radius_km': 25}),
+  ee.Feature(ee.Geometry.Point([-97.7431, 30.2672]), {'city': 'Austin', 'state': 'TX', 'rank': 4, 'radius_km': 22}),
+  ee.Feature(ee.Geometry.Point([-81.6557, 30.3322]), {'city': 'Jacksonville', 'state': 'FL', 'rank': 5, 'radius_km': 30}),
+  ee.Feature(ee.Geometry.Point([-97.3308, 32.7555]), {'city': 'Fort Worth', 'state': 'TX', 'rank': 6, 'radius_km': 22}),
+  ee.Feature(ee.Geometry.Point([-80.8431, 35.2271]), {'city': 'Charlotte', 'state': 'NC', 'rank': 7, 'radius_km': 18}),
+  ee.Feature(ee.Geometry.Point([-106.4800, 31.7776]), {'city': 'El Paso', 'state': 'TX', 'rank': 8, 'radius_km': 20}),
+  ee.Feature(ee.Geometry.Point([-77.0369, 38.9072]), {'city': 'Washington', 'state': 'DC', 'rank': 9, 'radius_km': 15}),
+  ee.Feature(ee.Geometry.Point([-86.7816, 36.1627]), {'city': 'Nashville', 'state': 'TN', 'rank': 10, 'radius_km': 22}),
+  ee.Feature(ee.Geometry.Point([-97.5164, 35.4676]), {'city': 'Oklahoma City', 'state': 'OK', 'rank': 11, 'radius_km': 28}),
+  ee.Feature(ee.Geometry.Point([-84.3880, 33.7490]), {'city': 'Atlanta', 'state': 'GA', 'rank': 12, 'radius_km': 20}),
+  ee.Feature(ee.Geometry.Point([-76.0929, 36.8529]), {'city': 'Virginia Beach', 'state': 'VA', 'rank': 13, 'radius_km': 22}),
+  ee.Feature(ee.Geometry.Point([-78.6382, 35.7796]), {'city': 'Raleigh', 'state': 'NC', 'rank': 14, 'radius_km': 18}),
+  ee.Feature(ee.Geometry.Point([-80.1918, 25.7617]), {'city': 'Miami', 'state': 'FL', 'rank': 15, 'radius_km': 15}),
+  ee.Feature(ee.Geometry.Point([-82.4572, 27.9506]), {'city': 'Tampa', 'state': 'FL', 'rank': 16, 'radius_km': 18}),
+  ee.Feature(ee.Geometry.Point([-95.9928, 36.1540]), {'city': 'Tulsa', 'state': 'OK', 'rank': 17, 'radius_km': 16}),
+  ee.Feature(ee.Geometry.Point([-97.1081, 32.7357]), {'city': 'Arlington', 'state': 'TX', 'rank': 18, 'radius_km': 14}),
+  ee.Feature(ee.Geometry.Point([-90.0715, 29.9511]), {'city': 'New Orleans', 'state': 'LA', 'rank': 19, 'radius_km': 18}),
+  ee.Feature(ee.Geometry.Point([-97.4034, 27.8006]), {'city': 'Corpus Christi', 'state': 'TX', 'rank': 20, 'radius_km': 16})
+])
+
+print(f"✓ Loaded {cities_southeast_20.size().getInfo()} cities")
+
+city_list = [
+    'Houston', 'San Antonio', 'Dallas', 'Austin', 'Jacksonville',
+    'Fort Worth', 'Charlotte', 'El Paso', 'Washington', 'Nashville',
+    'Oklahoma City', 'Atlanta', 'Virginia Beach', 'Raleigh', 'Miami',
+    'Tampa', 'Tulsa', 'Arlington', 'New Orleans', 'Corpus Christi'
+]
+
+print(f"✓ Defined {len(city_list)} cities")
+
+#%%
+
+def create_sampling_grid(feature):
+    # Buffer the point into a circular polygon using radius_km
+    radius_meters = ee.Number(feature.get('radius_km')).multiply(1000)
+    bbox = feature.geometry().buffer(radius_meters)
+
+    grid = ee.Image.pixelLonLat() \
+        .reproject(crs='EPSG:4326', scale=150)
+    points = grid.sample(
+        region=bbox,
+        scale=150,
+        geometries=True
+    )
+
+    city_name = feature.get('city')
+    state = feature.get('state')
+    rank = feature.get('rank')
+
+    def add_properties(point):
+        lon = point.get('longitude')
+        lat = point.get('latitude')
+        point_id = ee.String(city_name).cat('_').cat(ee.String(lon)).cat('_').cat(ee.String(lat))
+        return point.set({
+            'city': city_name,
+            'state': state,
+            'rank': rank,
+            'point_id': point_id
+        })
+
+    return points.map(add_properties)
+
+print("✓ Sampling grid will be built per city on demand")
 
 
+
+# %%
+#cloud masking
+def mask_clouds_landsat457(image):
+    """Cloud mask for Landsat 4, 5, and 7 using QA_PIXEL band"""
+    qa = image.select('QA_PIXEL')
+    # Bit 3 is cloud, bit 4 is cloud shadow
+    cloud_mask = qa.bitwiseAnd(1 << 3).eq(0) \
+        .And(qa.bitwiseAnd(1 << 4).eq(0))
+    return image.updateMask(cloud_mask)
+
+
+def mask_clouds_landsat89(image):
+    """Cloud mask for Landsat 8 and 9 using QA_PIXEL band"""
+    qa = image.select('QA_PIXEL')
+    # Bit 3 is cloud, bit 4 is cloud shadow
+    cloud_mask = qa.bitwiseAnd(1 << 3).eq(0) \
+        .And(qa.bitwiseAnd(1 << 4).eq(0))
+    return image.updateMask(cloud_mask)
+
+# %%
+
+#NDVI and LST Processing Functions
+def process_landsat457(image):
+    """
+    Process Landsat 4, 5, or 7 image to calculate NDVI and LST.
+
+    Band references for Landsat 4-5 and 7 Collection 2 Level 2:
+    - SR_B4 = Near Infrared (NIR)
+    - SR_B3 = Red
+    - ST_B6 = Surface Temperature
+    """
+    # Apply cloud mask
+    image = mask_clouds_landsat457(image)
+    # Calculate NDVI
+    ndvi = image.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI')
+    # Calculate LST
+    lst = image.select('ST_B6') \
+      .rename('LST')
+
+    #This gave me some really strange values
+
+    # Get date information
+    date = ee.Date(image.get('system:time_start'))
+
+    return image.addBands(ndvi).addBands(lst) \
+        .set('date', date.format('YYYY-MM-dd')) \
+        .set('year', date.get('year')) \
+        .set('month', date.get('month')) \
+        .set('day', date.get('day')) \
+        .set('sensor', 'Landsat_457')
+
+
+def process_landsat89(image):
+    """
+    Process Landsat 8 or 9 image to calculate NDVI and LST.
+
+    Band references for Landsat 8-9 Collection 2 Level 2:
+    - SR_B5 = Near Infrared (NIR)
+    - SR_B4 = Red
+    - ST_B10 = Surface Temperature
+    """
+    # Apply cloud mask
+    image = mask_clouds_landsat89(image)
+
+    # Calculate NDVI: (NIR - Red) / (NIR + Red)
+    ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI')
+
+    # Calculate LST
+    lst = image.select('ST_B10') \
+      .rename('LST')
+
+    # Get date information
+    date = ee.Date(image.get('system:time_start'))
+
+    return image.addBands(ndvi).addBands(lst) \
+        .set('date', date.format('YYYY-MM-dd')) \
+        .set('year', date.get('year')) \
+        .set('month', date.get('month')) \
+        .set('day', date.get('day')) \
+        .set('sensor', 'Landsat_89')
+
+print("✓ Defined NDVI/LST processing functions")
+
+
+# %%
+def get_landsat_for_city_year(city_geometry, year):
+    start_date = f'{year}-06-01'
+    end_date = f'{year}-09-30'
+    merged = ee.ImageCollection([])
+
+    # Landsat 5: 1984-2012
+    if year >= 1984 and year <= 2012:
+        landsat5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2') \
+            .filterBounds(city_geometry) \
+            .filterDate(start_date, end_date) \
+            .map(process_landsat457)
+        merged = merged.merge(landsat5)
+
+    # Landsat 7: only use when Landsat 5 is NOT available (1999 overlap handled above)
+    if year >= 2013 and year <= 2020:
+        landsat7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2') \
+            .filterBounds(city_geometry) \
+            .filterDate(start_date, end_date) \
+            .map(process_landsat457)
+        merged = merged.merge(landsat7)
+
+    # Landsat 8: 2013-present
+    if year >= 2013:
+        landsat8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2') \
+            .filterBounds(city_geometry) \
+            .filterDate(start_date, end_date) \
+            .map(process_landsat89)
+        merged = merged.merge(landsat8)
+
+    # Landsat 9: 2021-present
+    if year >= 2021:
+        landsat9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2') \
+            .filterBounds(city_geometry) \
+            .filterDate(start_date, end_date) \
+            .map(process_landsat89)
+        merged = merged.merge(landsat9)
+
+    return merged
+# %%
+#Function to Sample Points for One Image
+def sample_image_at_points(image, points):
+    """
+    Sample NDVI and LST values at all points for a single image.
+    Returns a FeatureCollection with values and metadata.
+    """
+
+    sampled = image.select(['NDVI', 'LST']).sampleRegions(
+        collection=points,
+        scale=150,
+        geometries=False  # Don't include geometry to reduce file size
+    )
+
+    # Add image metadata to each sampled point
+    date = image.get('date')
+    year = image.get('year')
+    month = image.get('month')
+    day = image.get('day')
+    sensor = image.get('sensor')
+
+    def add_metadata(feature):
+        return feature.set({
+            'date': date,
+            'year': year,
+            'month': month,
+            'day': day,
+            'sensor': sensor
+        })
+
+    return sampled.map(add_metadata)
+
+print("✓ Defined sampling function")
+# %%
+#Function to Process One City-Year Combination
+def process_city_year(city_name, year):
+    """
+    Process all Landsat data for one city and one year.
+    Returns a FeatureCollection ready for export.
+    """
+
+    # Get city bounding box
+    city_feature = cities_southeast_20.filter(ee.Filter.eq('city', city_name)).first()
+    city_geometry = city_feature.geometry()
+
+    # Build sampling grid on demand for this city only
+    city_points = create_sampling_grid(city_feature)
+
+    # Get all Landsat images for this city-year
+    images = get_landsat_for_city_year(city_geometry, year)
+
+    # Sample each image at all points
+    # This maps over the ImageCollection and returns a FeatureCollection for each image
+    def sample_wrapper(image):
+        return sample_image_at_points(image, city_points)
+
+    sampled = images.map(sample_wrapper).flatten()
+
+    return sampled
+
+print("✓ Defined city-year processing function")
+
+#%%
+# SECURITY: Never hardcode tokens in source code.
+# Store your Dropbox token in a .env file or set it as a shell environment variable:
+#   export DROPBOX_TOKEN="your_token_here"
+# Then load it here:
+import os
+from dotenv import load_dotenv
+load_dotenv()  # reads from .env file if present
+
+
+
+
+
+# %%
+# --- PROOF OF CONCEPT: Corpus Christi, Summer 2020 ---
+# Workflow: GEE → Google Drive (batch export) → download → Dropbox upload
+import time
+import io
+import dropbox
+import google.auth
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+DROPBOX_TOKEN = os.environ.get('DROPBOX_TOKEN')
+FILE_PREFIX = 'poc_corpus_christi_2020'
+DRIVE_FOLDER = 'GradThesis'
+DROPBOX_DEST = f'/GradThesis/{FILE_PREFIX}.csv'
+
+# --- Step 1: Export from GEE to Google Drive ---
+print("Running PoC: Corpus Christi, summer 2020...")
+result = process_city_year('Corpus Christi', 2020)
+
+print("Submitting batch export to Google Drive...")
+task = ee.batch.Export.table.toDrive(
+    collection=result,
+    description=FILE_PREFIX,
+    folder=DRIVE_FOLDER,
+    fileNamePrefix=FILE_PREFIX,
+    fileFormat='CSV',
+    selectors=['city', 'state', 'rank', 'point_id', 'date', 'year', 'month', 'day', 'sensor', 'NDVI', 'LST']
+)
+task.start()
+print(f"Task ID: {task.id}")
+
+while task.active():
+    print(f"  Status: {task.status()['state']}...")
+    time.sleep(30)
+
+final_status = task.status()
+print(f"Final status: {final_status['state']}")
+if final_status['state'] != 'COMPLETED':
+    raise RuntimeError(f"Export failed: {final_status.get('error_message', 'unknown')}")
+
+print("✓ Export complete.")
+
+# --- Step 2: Download CSV from Google Drive ---
+# Reuses the same Google credentials EE already authenticated with
+print("Downloading from Google Drive...")
+credentials, _ = google.auth.default(
+    scopes=['https://www.googleapis.com/auth/drive']
+)
+drive = build('drive', 'v3', credentials=credentials)
+
+# Find the GradThesis folder
+folder_res = drive.files().list(
+    q=f"name='{DRIVE_FOLDER}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+    fields="files(id)"
+).execute()
+folder_id = folder_res['files'][0]['id']
+
+# Find the exported CSV inside that folder
+file_res = drive.files().list(
+    q=f"name='{FILE_PREFIX}.csv' and '{folder_id}' in parents and trashed=false",
+    fields="files(id, name)"
+).execute()
+file_id = file_res['files'][0]['id']
+
+# Stream the file into memory
+buf = io.BytesIO()
+downloader = MediaIoBaseDownload(buf, drive.files().get_media(fileId=file_id))
+done = False
+while not done:
+    _, done = downloader.next_chunk()
+print(f"✓ Downloaded {FILE_PREFIX}.csv from Drive ({buf.tell() / 1e6:.1f} MB)")
+
+# --- Step 3: Upload to Dropbox ---
+print(f"Uploading to Dropbox: {DROPBOX_DEST} ...")
+buf.seek(0)
+data = buf.read()
+dbx = dropbox.Dropbox(DROPBOX_TOKEN)
+
+CHUNK = 150 * 1024 * 1024  # 150 MB — Dropbox upload session limit
+if len(data) <= CHUNK:
+    dbx.files_upload(data, DROPBOX_DEST, mode=dropbox.files.WriteMode.overwrite)
+else:
+    # Chunked upload for large files
+    session = dbx.files_upload_session_start(data[:CHUNK])
+    cursor = dropbox.files.UploadSessionCursor(session_id=session.session_id, offset=CHUNK)
+    offset = CHUNK
+    while offset < len(data):
+        chunk = data[offset:offset + CHUNK]
+        if offset + CHUNK >= len(data):
+            commit = dropbox.files.CommitInfo(path=DROPBOX_DEST, mode=dropbox.files.WriteMode.overwrite)
+            dbx.files_upload_session_finish(chunk, cursor, commit)
+        else:
+            dbx.files_upload_session_append_v2(chunk, cursor)
+            cursor = dropbox.files.UploadSessionCursor(session_id=cursor.session_id, offset=cursor.offset + len(chunk))
+        offset += CHUNK
+
+print(f"✓ Uploaded to Dropbox: {DROPBOX_DEST}")
+
+# --- Step 4: Delete CSV from Google Drive to free storage ---
+print("Deleting from Google Drive...")
+drive.files().delete(fileId=file_id).execute()
+print(f"✓ Deleted {FILE_PREFIX}.csv from Google Drive")
+# %%
