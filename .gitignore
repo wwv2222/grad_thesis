@@ -1,3 +1,6 @@
+# Large data files
+*.csv
+
 # History files
 .Rhistory
 .Rapp.history

@@ -5,11 +5,7 @@ import subprocess
 subprocess.run(["pip3", "install", "earthengine-api", "--quiet"])
 subprocess.run(["pip3", "install", "dropbox", "--quiet"])
 subprocess.run(["pip3", "install", "python-dotenv", "google-api-python-client", "pandas", "--quiet"])
-
-# %%
 import ee
-
-# %%
 ee.Authenticate()
 ee.Initialize(project='grad-thesis-475918')
 
@@ -49,7 +45,7 @@ city_list = [
 
 print(f"✓ Defined {len(city_list)} cities")
 
-#%%
+
 #Function to create sampling grid for a city based on its radius
 def create_sampling_grid(feature):
     # Buffer the point into a circular polygon using radius_km
@@ -82,7 +78,6 @@ print("✓ Sampling grid will be built per city on demand")
 
 
 
-# %%
 #cloud masking
 def mask_clouds_landsat457(image):
     """Cloud mask for Landsat 4, 5, and 7 using QA_PIXEL band"""
@@ -100,7 +95,7 @@ def mask_clouds_landsat89(image):
         .And(qa.bitwiseAnd(1 << 4).eq(0))
     return image.updateMask(cloud_mask)
 
-# %%
+
 
 #NDVI and LST Processing Functions
 def process_landsat457(image):
@@ -162,7 +157,7 @@ def process_landsat89(image):
 print("✓ Defined NDVI/LST processing functions")
 
 
-# %%
+
 def get_landsat_for_city_year(city_geometry, year):
     start_date = f'{year}-06-01'
     end_date = f'{year}-09-30'
@@ -176,13 +171,8 @@ def get_landsat_for_city_year(city_geometry, year):
             .map(process_landsat457)
         merged = merged.merge(landsat5)
 
-    # Landsat 7: only use when Landsat 5 is NOT available (1999 overlap handled above)
-    if year >= 2013 and year <= 2020:
-        landsat7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2') \
-            .filterBounds(city_geometry) \
-            .filterDate(start_date, end_date) \
-            .map(process_landsat457)
-        merged = merged.merge(landsat7)
+    # Landsat 7 excluded entirely — SLC failure after May 2003 causes ~22% missing pixels.
+    # Landsat 8 covers 2013+ so Landsat 7 is not needed.
 
     # Landsat 8: 2013-present
     if year >= 2013:
@@ -201,7 +191,7 @@ def get_landsat_for_city_year(city_geometry, year):
         merged = merged.merge(landsat9)
 
     return merged
-# %%
+
 #Function to Sample Points for One Image
 def sample_image_at_points(image, points):
     """
@@ -234,15 +224,16 @@ def sample_image_at_points(image, points):
     return sampled.map(add_metadata)
 
 print("✓ Defined sampling function")
-# %%
+
 #Function to Process One City-Year Combination
 def process_city_year(city_name, year, poc_sample=None):
     """
     Process all Landsat data for one city and one year.
+    Composites all images into a single median image, then samples once.
     Returns a FeatureCollection ready for export.
     """
 
-    # Get city bounding box
+    # Get city feature and geometry
     city_feature = cities_southeast_20.filter(ee.Filter.eq('city', city_name)).first()
     city_geometry = city_feature.geometry()
 
@@ -254,18 +245,20 @@ def process_city_year(city_name, year, poc_sample=None):
     # Get all Landsat images for this city-year
     images = get_landsat_for_city_year(city_geometry, year)
 
-    # Sample each image at all points
-    # This maps over the ImageCollection and returns a FeatureCollection for each image
-    def sample_wrapper(image):
-        return sample_image_at_points(image, city_points)
-
-    sampled = images.map(sample_wrapper).flatten()
+    # Composite all images into a single median image, add lat/lon bands, sample once
+    composite = images.select(['NDVI', 'LST']).median() \
+        .addBands(ee.Image.pixelLonLat())
+    sampled = composite.sampleRegions(
+        collection=city_points,
+        scale=150,
+        geometries=False
+    ).map(lambda f: f.set('year', year))
 
     return sampled
 
 print("✓ Defined city-year processing function")
 
-#%%
+
 # SECURITY: Never hardcode tokens in source code.
 # Store your Dropbox token in a .env file or set it as a shell environment variable:
 #   export DROPBOX_TOKEN="your_token_here"
@@ -314,7 +307,12 @@ YEARS = range(1984, 2025)
 CHUNK = 150 * 1024 * 1024  # 150 MB — Dropbox chunked upload limit
 
 # Set up Google Drive and Dropbox clients once
-credentials, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/drive'])
+_adc_path = os.path.expanduser('~/.config/gcloud/application_default_credentials.json')
+if os.path.isfile(_adc_path):
+    from google.oauth2.credentials import Credentials as _OAuthCreds
+    credentials = _OAuthCreds.from_authorized_user_file(_adc_path, scopes=['https://www.googleapis.com/auth/drive'])
+else:
+    credentials, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/drive'])
 drive = build('drive', 'v3', credentials=credentials)
 
 folder_res = drive.files().list(
@@ -329,7 +327,7 @@ dbx = dropbox.Dropbox(
     app_secret=os.environ.get('DROPBOX_APP_SECRET')
 )
 
-SELECTORS = ['city', 'state', 'rank', 'longitude', 'latitude', 'date', 'year', 'month', 'day', 'sensor', 'NDVI', 'LST']
+SELECTORS = ['city', 'state', 'rank', 'longitude', 'latitude', 'year', 'NDVI', 'LST']
 
 
 def export_year_to_drive(city_name, year, folder_id):
@@ -400,15 +398,115 @@ def upload_to_dropbox(df, dropbox_path):
             offset += CHUNK
 
 
-# --- Main loop: one city at a time ---
+# --- Main loop: one city at a time, batch concurrent GEE exports ---
+BATCH_SIZE = 15  # GEE concurrent task limit
+
+# %%
 for city_name in city_list:
     print(f"\n{'='*50}")
     print(f"Processing {city_name} ({len(YEARS)} years)...")
 
-    for year in YEARS:
-        print(f"  [{city_name}] {year} — exporting...", end=' ', flush=True)
-        task, file_prefix = export_year_to_drive(city_name, year, folder_id)
+    # Skip fully completed cities
+    if city_name in ['Houston', 'San Antonio', 'Dallas', 'Austin', 'Jacksonville',
+                     'Fort Worth', 'Charlotte', 'El Paso', 'Washington', 'Nashville',
+                     'Oklahoma City', 'Atlanta', 'Virginia Beach', 'Raleigh', 'Miami',
+                     'Tampa', 'Tulsa']:
+        print(f"  Skipping — already complete.")
+        continue
 
+    # Arlington: resume from 2004 (1984-2003 already exported)
+    if city_name == 'Arlington':
+        years_remaining = list(range(2004, 2025))
+    else:
+        years_remaining = list(YEARS)
+
+    while years_remaining:
+        # Launch up to BATCH_SIZE tasks at once
+        batch = years_remaining[:BATCH_SIZE]
+        years_remaining = years_remaining[BATCH_SIZE:]
+
+        active_tasks = []
+        for year in batch:
+            print(f"  [{city_name}] {year} — submitting...", flush=True)
+            task, file_prefix = export_year_to_drive(city_name, year, folder_id)
+            active_tasks.append((task, file_prefix, year))
+
+        # Wait for each task in the batch and download/upload as they complete
+        for task, file_prefix, year in active_tasks:
+            print(f"  [{city_name}] {year} — waiting...", end=' ', flush=True)
+            while task.active():
+                time.sleep(30)
+
+            status = task.status()
+            if status['state'] != 'COMPLETED':
+                print(f"FAILED ({status.get('error_message', 'unknown')}) — skipping")
+                continue
+
+            df = download_and_delete_from_drive(file_prefix, folder_id)
+            dropbox_path = f"/20 Cities/{city_name.lower().replace(' ', '_')}_{year}.csv"
+            upload_to_dropbox(df, dropbox_path)
+            print(f"✓ {len(df):,} rows → Dropbox")
+
+print("\n✓ All cities complete.")
+# %%
+# --- RETRY: Arlington 2002-2003 and Fort Worth 1984-2016 ---
+RETRY_TARGETS = [
+    ('Arlington', [2002, 2003]),
+    ('Fort Worth', list(range(1984, 2017))),
+]
+
+for city_name, retry_years in RETRY_TARGETS:
+    print(f"\n{'='*50}")
+    print(f"Retrying {city_name}: {retry_years[0]}–{retry_years[-1]} ({len(retry_years)} years)...")
+
+    years_remaining = list(retry_years)
+    while years_remaining:
+        batch = years_remaining[:BATCH_SIZE]
+        years_remaining = years_remaining[BATCH_SIZE:]
+
+        active_tasks = []
+        for year in batch:
+            print(f"  [{city_name}] {year} — submitting...", flush=True)
+            task, file_prefix = export_year_to_drive(city_name, year, folder_id)
+            active_tasks.append((task, file_prefix, year))
+
+        for task, file_prefix, year in active_tasks:
+            print(f"  [{city_name}] {year} — waiting...", end=' ', flush=True)
+            while task.active():
+                time.sleep(30)
+
+            status = task.status()
+            if status['state'] != 'COMPLETED':
+                print(f"FAILED ({status.get('error_message', 'unknown')}) — skipping")
+                continue
+
+            df = download_and_delete_from_drive(file_prefix, folder_id)
+            dropbox_path = f"/20 Cities/{city_name.lower().replace(' ', '_')}_{year}.csv"
+            upload_to_dropbox(df, dropbox_path)
+            print(f"✓ {len(df):,} rows → Dropbox")
+
+print("\n✓ Retry complete.")
+# %%
+# --- RESCRAPE: All cities, 2012 — replace city subfolder CSVs ---
+BATCH_SIZE = 15  # GEE concurrent task limit
+RESCRAPE_YEAR = 2012
+
+print(f"\n{'='*50}")
+print(f"Rescraping year {RESCRAPE_YEAR} for all {len(city_list)} cities...")
+
+cities_remaining = list(city_list)
+while cities_remaining:
+    batch = cities_remaining[:BATCH_SIZE]
+    cities_remaining = cities_remaining[BATCH_SIZE:]
+
+    active_tasks = []
+    for city_name in batch:
+        print(f"  [{city_name}] {RESCRAPE_YEAR} — submitting...", flush=True)
+        task, file_prefix = export_year_to_drive(city_name, RESCRAPE_YEAR, folder_id)
+        active_tasks.append((task, file_prefix, city_name))
+
+    for task, file_prefix, city_name in active_tasks:
+        print(f"  [{city_name}] {RESCRAPE_YEAR} — waiting...", end=' ', flush=True)
         while task.active():
             time.sleep(30)
 
@@ -418,9 +516,184 @@ for city_name in city_list:
             continue
 
         df = download_and_delete_from_drive(file_prefix, folder_id)
-        dropbox_path = f"/GradThesis/{city_name.lower().replace(' ', '_')}_{year}.csv"
+        slug = city_name.lower().replace(' ', '_')
+        dropbox_path = f"/20 Cities/{city_name}/{slug}_{RESCRAPE_YEAR}.csv"
         upload_to_dropbox(df, dropbox_path)
         print(f"✓ {len(df):,} rows → Dropbox")
 
-print("\n✓ All cities complete.")
+print(f"\n✓ Rescrape of {RESCRAPE_YEAR} complete.")
+
+
+# --- MNDWI processing functions ---
+def process_landsat457_mndwi(image):
+    """Landsat 4/5/7: MNDWI = (SR_B2 Green - SR_B5 SWIR1) / (SR_B2 + SR_B5)"""
+    image = mask_clouds_landsat457(image)
+    mndwi = image.normalizedDifference(['SR_B2', 'SR_B5']).rename('MNDWI')
+    date = ee.Date(image.get('system:time_start'))
+    return image.addBands(mndwi) \
+        .set('date', date.format('YYYY-MM-dd')) \
+        .set('year', date.get('year')) \
+        .set('sensor', 'Landsat_457')
+
+def process_landsat89_mndwi(image):
+    """Landsat 8/9: MNDWI = (SR_B3 Green - SR_B6 SWIR1) / (SR_B3 + SR_B6)"""
+    image = mask_clouds_landsat89(image)
+    mndwi = image.normalizedDifference(['SR_B3', 'SR_B6']).rename('MNDWI')
+    date = ee.Date(image.get('system:time_start'))
+    return image.addBands(mndwi) \
+        .set('date', date.format('YYYY-MM-dd')) \
+        .set('year', date.get('year')) \
+        .set('sensor', 'Landsat_89')
+
+def get_landsat_mndwi_for_city_year(city_geometry, year):
+    start_date = f'{year}-06-01'
+    end_date = f'{year}-09-30'
+    merged = ee.ImageCollection([])
+    if year >= 1984 and year <= 2012:
+        merged = merged.merge(
+            ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+                .filterBounds(city_geometry)
+                .filterDate(start_date, end_date)
+                .map(process_landsat457_mndwi)
+        )
+    if year >= 2013:
+        merged = merged.merge(
+            ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+                .filterBounds(city_geometry)
+                .filterDate(start_date, end_date)
+                .map(process_landsat89_mndwi)
+        )
+    if year >= 2021:
+        merged = merged.merge(
+            ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+                .filterBounds(city_geometry)
+                .filterDate(start_date, end_date)
+                .map(process_landsat89_mndwi)
+        )
+    return merged
+
+def process_city_year_mndwi(city_name, year):
+    city_feature = cities_southeast_20.filter(ee.Filter.eq('city', city_name)).first()
+    city_points = create_sampling_grid(city_feature)
+    images = get_landsat_mndwi_for_city_year(city_feature.geometry(), year)
+    composite = images.select('MNDWI').median().addBands(ee.Image.pixelLonLat())
+    return composite.sampleRegions(
+        collection=city_points,
+        scale=150,
+        geometries=False
+    ).map(lambda f: f.set('year', year))
+
+def export_mndwi_year_to_drive(city_name, year, folder_id):
+    file_prefix = f"{city_name.lower().replace(' ', '_')}_mndwi_{year}"
+    result = process_city_year_mndwi(city_name, year)
+    task = ee.batch.Export.table.toDrive(
+        collection=result,
+        description=file_prefix,
+        folder=DRIVE_FOLDER,
+        fileNamePrefix=file_prefix,
+        fileFormat='CSV',
+        selectors=['city', 'state', 'rank', 'longitude', 'latitude', 'year', 'MNDWI']
+    )
+    task.start()
+    return task, file_prefix
+
+
+# --- MNDWI: All cities, all years 1984-2024 ---
+print(f"\n{'='*50}")
+print(f"Collecting MNDWI: {len(city_list)} cities × {len(list(YEARS))} years...")
+
+for city_name in city_list:
+    print(f"\n  Processing {city_name}...")
+    years_remaining = list(YEARS)
+    while years_remaining:
+        batch = years_remaining[:BATCH_SIZE]
+        years_remaining = years_remaining[BATCH_SIZE:]
+
+        active_tasks = []
+        for year in batch:
+            print(f"    [{city_name}] {year} — submitting...", flush=True)
+            task, file_prefix = export_mndwi_year_to_drive(city_name, year, folder_id)
+            active_tasks.append((task, file_prefix, year))
+
+        for task, file_prefix, year in active_tasks:
+            print(f"    [{city_name}] {year} — waiting...", end=' ', flush=True)
+            while task.active():
+                time.sleep(30)
+            status = task.status()
+            if status['state'] != 'COMPLETED':
+                print(f"FAILED ({status.get('error_message', 'unknown')}) — skipping")
+                continue
+            df = download_and_delete_from_drive(file_prefix, folder_id)
+            slug = city_name.lower().replace(' ', '_')
+            dropbox_path = f"/20 Cities/{city_name}/{slug}_mndwi_{year}.csv"
+            upload_to_dropbox(df, dropbox_path)
+            print(f"✓ {len(df):,} rows → Dropbox")
+
+print("\n✓ MNDWI collection complete.")
+
+
+# --- NLCD processing functions ---
+def process_city_nlcd_year(city_name, nlcd_year):
+    city_feature = cities_southeast_20.filter(ee.Filter.eq('city', city_name)).first()
+    city_points = create_sampling_grid(city_feature)
+    nlcd_image = ee.ImageCollection('USGS/NLCD_RELEASES/2021_REL/NLCD') \
+        .filter(ee.Filter.calendarRange(nlcd_year, nlcd_year, 'year')) \
+        .first()
+    composite = nlcd_image.select('landcover').addBands(ee.Image.pixelLonLat())
+    return composite.sampleRegions(
+        collection=city_points,
+        scale=30,
+        geometries=False
+    ).map(lambda f: f.set('nlcd_year', nlcd_year))
+
+def export_nlcd_year_to_drive(city_name, nlcd_year, folder_id):
+    file_prefix = f"{city_name.lower().replace(' ', '_')}_nlcd_{nlcd_year}"
+    result = process_city_nlcd_year(city_name, nlcd_year)
+    task = ee.batch.Export.table.toDrive(
+        collection=result,
+        description=file_prefix,
+        folder=DRIVE_FOLDER,
+        fileNamePrefix=file_prefix,
+        fileFormat='CSV',
+        selectors=['city', 'state', 'rank', 'longitude', 'latitude', 'nlcd_year', 'landcover']
+    )
+    task.start()
+    return task, file_prefix
+
+
+# --- NLCD: All cities, all available NLCD years ---
+NLCD_YEARS = [2001, 2004, 2006, 2008, 2011, 2013, 2016, 2019, 2021]
+
+print(f"\n{'='*50}")
+print(f"Collecting NLCD: {len(city_list)} cities × {len(NLCD_YEARS)} years...")
+
+for city_name in city_list:
+    print(f"\n  Processing {city_name}...")
+    nlcd_remaining = list(NLCD_YEARS)
+    while nlcd_remaining:
+        batch = nlcd_remaining[:BATCH_SIZE]
+        nlcd_remaining = nlcd_remaining[BATCH_SIZE:]
+
+        active_tasks = []
+        for nlcd_year in batch:
+            print(f"    [{city_name}] NLCD {nlcd_year} — submitting...", flush=True)
+            task, file_prefix = export_nlcd_year_to_drive(city_name, nlcd_year, folder_id)
+            active_tasks.append((task, file_prefix, nlcd_year))
+
+        for task, file_prefix, nlcd_year in active_tasks:
+            print(f"    [{city_name}] NLCD {nlcd_year} — waiting...", end=' ', flush=True)
+            while task.active():
+                time.sleep(30)
+            status = task.status()
+            if status['state'] != 'COMPLETED':
+                print(f"FAILED ({status.get('error_message', 'unknown')}) — skipping")
+                continue
+            df = download_and_delete_from_drive(file_prefix, folder_id)
+            slug = city_name.lower().replace(' ', '_')
+            dropbox_path = f"/20 Cities/{city_name}/{slug}_nlcd_{nlcd_year}.csv"
+            upload_to_dropbox(df, dropbox_path)
+            print(f"✓ {len(df):,} rows → Dropbox")
+
+print("\n✓ NLCD collection complete.")
+
 # %%
