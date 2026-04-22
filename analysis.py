@@ -3,30 +3,83 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import statsmodels.formula.api as smf
 from pathlib import Path
 from linearmodels.panel import PanelOLS
+from scipy.spatial import cKDTree
+
+CONLEY_CUTOFF_KM = 5  # spatial autocorrelation cutoff for Conley SEs
+
+def conley_se(res, lat, lon, cutoff_km=CONLEY_CUTOFF_KM):
+    """Conley (1999) spatial HAC SEs with Bartlett kernel."""
+    coords_rad = np.radians(np.column_stack([lat, lon]))
+    cutoff_rad = cutoff_km / 6371.0
+    e = res.resid.values
+    X = res.model.exog
+    Xe = X * e[:, None]
+    meat = Xe.T @ Xe  # self terms
+    tree = cKDTree(coords_rad)
+    pairs = tree.query_pairs(cutoff_rad, output_type='ndarray')
+    if len(pairs):
+        i_idx, j_idx = pairs[:, 0], pairs[:, 1]
+        d = np.linalg.norm(coords_rad[i_idx] - coords_rad[j_idx], axis=1) / cutoff_rad
+        w = 1.0 - d  # Bartlett kernel
+        wXe_i = w[:, None] * Xe[i_idx]
+        cross = wXe_i.T @ Xe[j_idx]
+        meat += cross + cross.T
+    bread = np.linalg.inv(X.T @ X)
+    V = bread @ meat @ bread
+    return np.sqrt(np.diag(V))
 
 # ── Base load ─────────────────────────────────────────────────────────────────
 raw = pd.read_csv("/home/wwdelvalle/20_cities_panel_clean.csv", low_memory=False)
+
+# ── City center coordinates (from scraping.py feature collection) ─────────────
+CITY_CENTERS = {
+    'houston':        (-95.3698, 29.7604),
+    'san antonio':    (-98.4936, 29.4241),
+    'dallas':         (-96.7970, 32.7767),
+    'austin':         (-97.7431, 30.2672),
+    'jacksonville':   (-81.6557, 30.3322),
+    'fort worth':     (-97.3308, 32.7555),
+    'charlotte':      (-80.8431, 35.2271),
+    'el paso':        (-106.4800, 31.7776),
+    'washington':     (-77.0369, 38.9072),
+    'nashville':      (-86.7816, 36.1627),
+    'oklahoma city':  (-97.5164, 35.4676),
+    'atlanta':        (-84.3880, 33.7490),
+    'virginia beach': (-76.0929, 36.8529),
+    'raleigh':        (-78.6382, 35.7796),
+    'miami':          (-80.1918, 25.7617),
+    'tampa':          (-82.4572, 27.9506),
+    'tulsa':          (-95.9928, 36.1540),
+    'arlington':      (-97.1081, 32.7357),
+    'new orleans':    (-90.0715, 29.9511),
+    'corpus christi': (-97.4034, 27.8006),
+}
+
+def _dist_to_center(grp):
+    key = grp['city'].iloc[0].lower()
+    if key not in CITY_CENTERS:
+        return pd.Series(np.nan, index=grp.index)
+    clon, clat = CITY_CENTERS[key]
+    lat_rad = np.radians((grp['latitude'].mean() + clat) / 2)
+    dlat_m = (grp['latitude'].values - clat) * 111_000
+    dlon_m = (grp['longitude'].values - clon) * 111_000 * np.cos(lat_rad)
+    return pd.Series(np.sqrt(dlat_m**2 + dlon_m**2) / 1_000, index=grp.index)
+
+raw['dist_to_center_km'] = raw.groupby('city', group_keys=False).apply(_dist_to_center)
+print(f"dist_to_center_km — {raw['dist_to_center_km'].notna().sum():,} non-null  "
+      f"| mean {raw['dist_to_center_km'].mean():.1f} km  "
+      f"| max {raw['dist_to_center_km'].max():.1f} km")
 
 # Model 1: all non-water pixels across all cities
 df_all = raw[raw["is_water"] == 0].copy()
 print(f"Observations (non-water, all cities): {len(df_all):,}")
 df_all = df_all.set_index(["city", "year"])
 
-# Models 2-4: non-water pixels in cities that have dist_to_park_m data
+# Model 4 sample prep (park-distance cities, non-water, with park distance)
 df = raw[(raw["is_water"] == 0) & raw["dist_to_park_m"].notna()].copy()
-print(f"Observations (non-water, with park distance): {len(df):,}")
-
-# Map nearest_park_size (1/2/3) to labels; reference category = small
-df["park_size_cat"] = pd.Categorical(
-    df["nearest_park_size"].map({1: "small", 2: "medium", 3: "large"}),
-    categories=["small", "medium", "large"],
-    ordered=True
-)
-print("Park size distribution:\n", df["park_size_cat"].value_counts(), "\n")
-
-# Two-way FE index: city (entity) + year (time)
 df = df.set_index(["city", "year"])
 
 # ── Model 1: LST ~ NDVI + near_water | city + year ───────────────────────────
@@ -41,37 +94,94 @@ model1 = PanelOLS.from_formula(
 result1 = model1.fit(cov_type="clustered", cluster_entity=True)
 print(result1.summary)
 
-# ── Model 2: LST ~ dist_to_park_m + NDVI + near_water ────────────────────────
-# Note: in_park_patch is dropped — dist_to_park_m is only recorded for pixels
-# outside park patches, so after the notna() filter all remaining observations
-# have in_park_patch == 0 (constant), making it collinear.
+# ── Models 2 & 3: per-city OLS with year FE ───────────────────────────────────
+# Within a single city, EntityEffects reduces to a constant (collinear).
+# dist_to_center_km is time-invariant per pixel so pixel FE would absorb it.
+# OLS + year dummies (C(year)) with HC1 robust SEs is the right specification.
+PARK_DIST_CITIES = ['arlington', 'corpus christi', 'miami', 'oklahoma city', 'tulsa']
+
+# ── Model 2: per city ─────────────────────────────────────────────────────────
 print("\n" + "="*80)
-print("MODEL 2: LST ~ dist_to_park_m + near_water  (city + year FE)")
+print("MODEL 2 (per city): LST ~ dist_to_park_m + dist_to_center_km + NDVI + near_water + year FE")
 print("="*80)
 
-model2 = PanelOLS.from_formula(
-    "LST ~ dist_to_park_m + near_water + EntityEffects + TimeEffects",
-    data=df
-)
-result2 = model2.fit(cov_type="clustered", cluster_entity=True)
-print(result2.summary)
+results2 = {}
+for city_name in PARK_DIST_CITIES:
+    df_city = raw[
+        (raw['is_water'] == 0) &
+        (raw['in_park_patch'] == 0) &
+        (raw['city'].str.lower() == city_name) &
+        (raw['year'].between(2011, 2021))
+    ].copy()
+    if len(df_city) == 0:
+        print(f"\n{city_name.title()}: no data")
+        continue
+    df_city['log_dist'] = np.log(df_city['dist_to_park_m'] + 1)
+    res = smf.ols(
+        "LST ~ log_dist + dist_to_center_km + near_water + C(year)",
+        data=df_city
+    ).fit(cov_type='HC1')
+    results2[city_name] = res
+    print(f"\n{'='*40}")
+    print(f"City: {city_name.title()}  (n={len(df_city):,})")
+    print(f"{'='*40}")
+    print(res.summary())
+    cse = conley_se(res, df_city['latitude'].values, df_city['longitude'].values)
+    se_tbl = pd.DataFrame({
+        'coef':      res.params,
+        'HC1 SE':    res.bse,
+        'Conley SE': cse,
+    })
+    print(f"\nConley SEs (cutoff={CONLEY_CUTOFF_KM} km):")
+    print(se_tbl.to_string())
 
-# ── Model 3: Heterogeneity — dist_to_park_m × park size ──────────────────────
-# The interaction coefficient answers: does an extra meter from a medium/large
-# park cool LST differently than an extra meter from a small park?
-# Reference category = small; positive interaction = weaker cooling vs. small.
+# ── Model 3: per city — dist_to_park_m × park size ───────────────────────────
 print("\n" + "="*80)
-print("MODEL 3: LST ~ dist_to_park_m * park_size_cat + near_water")
-print("         (city + year FE)  — cooling by distance, heterogeneous across park sizes")
+print("MODEL 3 (per city): LST ~ dist_to_park_m * park_size_cat + dist_to_center_km + year FE")
 print("="*80)
 
-model3 = PanelOLS.from_formula(
-    "LST ~ dist_to_park_m * C(park_size_cat) + near_water"
-    " + EntityEffects + TimeEffects",
-    data=df
-)
-result3 = model3.fit(cov_type="clustered", cluster_entity=True)
-print(result3.summary)
+results3 = {}
+for city_name in PARK_DIST_CITIES:
+    df_city = raw[
+        (raw['is_water'] == 0) &
+        (raw['city'].str.lower() == city_name) &
+        (raw['year'].between(2011, 2021))
+    ].copy()
+    # Park pixels are inside the park — distance is 0
+    df_city.loc[df_city['is_park_pixel'] == 1, 'dist_to_park_m'] = 0.0
+    # For in-patch pixels, use their own patch size as the nearest park size
+    _size_map = {'small': 1, 'medium': 2, 'large': 3}
+    _patch_mask = df_city['in_park_patch'] == 1
+    df_city.loc[_patch_mask, 'nearest_park_size'] = (
+        df_city.loc[_patch_mask, 'park_size'].map(_size_map)
+    )
+    df_city['park_size_cat'] = pd.Categorical(
+        df_city['nearest_park_size'].map({1: 'small', 2: 'medium', 3: 'large'}),
+        categories=['small', 'medium', 'large'],
+        ordered=True,
+    )
+    df_city = df_city[df_city['park_size_cat'].notna()]
+    if len(df_city) < 2 or df_city['park_size_cat'].nunique() < 2:
+        print(f"\n{city_name.title()}: insufficient park size variety — skipped")
+        continue
+    df_city['log_dist'] = np.log(df_city['dist_to_park_m'] + 1)
+    res = smf.ols(
+        "LST ~ log_dist * C(park_size_cat) + dist_to_center_km + near_water + C(year)",
+        data=df_city
+    ).fit(cov_type='HC1')
+    results3[city_name] = res
+    print(f"\n{'='*40}")
+    print(f"City: {city_name.title()}  (n={len(df_city):,})")
+    print(f"{'='*40}")
+    print(res.summary())
+    cse = conley_se(res, df_city['latitude'].values, df_city['longitude'].values)
+    se_tbl = pd.DataFrame({
+        'coef':      res.params,
+        'HC1 SE':    res.bse,
+        'Conley SE': cse,
+    })
+    print(f"\nConley SEs (cutoff={CONLEY_CUTOFF_KM} km):")
+    print(se_tbl.to_string())
 
 # ── Model 4: Regression Discontinuity — park boundary threshold ──────────────
 # Running variable: distance from park boundary (signed)
@@ -93,7 +203,8 @@ park_cities = df.index.get_level_values("city").unique().tolist()
 rdd = raw[
     (raw["is_water"] == 0) &
     (raw["city"].isin(park_cities)) &
-    ((raw["in_park_patch"] == 1) | (raw["dist_to_park_m"] <= 1000))
+    ((raw["in_park_patch"] == 1) | (raw["dist_to_park_m"] <= 1000)) &
+    (raw["year"].between(2011, 2021))
 ].copy()
 
 # Build the signed running variable and treatment indicator
@@ -111,6 +222,26 @@ model4 = PanelOLS.from_formula(
 )
 result4 = model4.fit(cov_type="clustered", cluster_entity=True)
 print(result4.summary)
+
+# Conley SEs for Model 4: two-way within-demean (city + year FE), then OLS
+_r4 = rdd[['LST', 'D', 'running_var', 'near_water', 'latitude', 'longitude']].copy().astype(float)
+for _col in ['LST', 'D', 'running_var', 'near_water']:
+    _city_m  = _r4.groupby(level='city')[_col].transform('mean')
+    _year_m  = _r4.groupby(level='year')[_col].transform('mean')
+    _grand_m = _r4[_col].mean()
+    _r4[f'{_col}_dm'] = _r4[_col] - _city_m - _year_m + _grand_m
+_res4_ols = smf.ols(
+    "LST_dm ~ D_dm + running_var_dm + near_water_dm - 1",
+    data=_r4
+).fit()
+_cse4 = conley_se(_res4_ols, _r4['latitude'].values, _r4['longitude'].values)
+_se4_tbl = pd.DataFrame({
+    'coef':         result4.params,
+    'Clustered SE': result4.std_errors,
+    'Conley SE':    pd.Series(_cse4, index=result4.params.index),
+})
+print(f"\nConley SEs for Model 4 (cutoff={CONLEY_CUTOFF_KM} km):")
+print(_se4_tbl.to_string())
 
 # ── Plot 1: Residualized scatter (0–500 m bandwidth) ─────────────────────────
 # Partial out city-year FE and NDVI via within-demean + OLS, then plot
